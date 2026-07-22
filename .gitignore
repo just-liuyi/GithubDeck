@@ -1,0 +1,40 @@
+# Python
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.py[cod]
+python-version/build/
+python-version/dist/
+
+# Node / frontend
+**/node_modules/
+rust-version/dist/
+
+# Rust / Tauri
+rust-version/src-tauri/target/
+
+# Release staging and migration backups
+release-staging/
+*.bundle
+*release-metadata*.json
+
+# Test, coverage, and logs
+.coverage
+htmlcov/
+coverage/
+*.log
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+*.local.json
+
+# Local workflow state
+.superpowers/
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
