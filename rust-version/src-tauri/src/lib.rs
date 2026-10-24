@@ -1,135 +1,188 @@
+mod account_meta;
 mod auth_parser;
+mod browsers;
 mod controller;
 mod gh_process;
 mod models;
 mod settings;
 
-use controller::AuthController;
-use gh_process::GhProcess;
+use account_meta::MetaStore;
+use browsers::BrowserTarget;
+use controller::{AppStateSnapshot, AuthController, BrowserPlatform};
+use gh_process::GhCli;
 use settings::GhExecutableSettings;
 use std::sync::Arc;
-use tauri::{AppHandle, Listener, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
-struct AppState {
-    controller: AuthController,
+type Controller = AuthController<GhCli>;
+
+struct DesktopPlatform {
+    app: AppHandle,
+}
+
+impl BrowserPlatform for DesktopPlatform {
+    fn detect(&self) -> Vec<BrowserTarget> {
+        browsers::detect()
+    }
+
+    fn open(&self, target: Option<&BrowserTarget>, url: &str) -> Result<(), String> {
+        match target {
+            Some(target) => browsers::launch(target, url),
+            None => self
+                .app
+                .opener()
+                .open_url(url, None::<String>)
+                .map_err(|_| "无法打开系统默认浏览器".to_string()),
+        }
+    }
 }
 
 #[tauri::command]
-async fn get_state(
-    state: State<'_, Arc<AppState>>,
-) -> Result<controller::AppStateSnapshot, String> {
-    Ok(state.controller.snapshot().await)
+async fn get_state(controller: State<'_, Controller>) -> Result<AppStateSnapshot, String> {
+    Ok(controller.snapshot())
 }
 
 #[tauri::command]
-async fn refresh_accounts(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.controller.refresh(app).await
+async fn refresh_accounts(controller: State<'_, Controller>) -> Result<(), String> {
+    controller.refresh()
 }
 
 #[tauri::command]
 async fn switch_account(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
+    controller: State<'_, Controller>,
     host: String,
     login: String,
 ) -> Result<(), String> {
-    state.controller.switch_account(app, host, login).await
+    controller.switch_account(host, login)
 }
 
 #[tauri::command]
 async fn logout_account(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
+    controller: State<'_, Controller>,
     host: String,
     login: String,
 ) -> Result<(), String> {
-    state.controller.logout(app, host, login).await
+    controller.logout(host, login)
 }
 
 #[tauri::command]
-async fn login_account(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.controller.login(app).await
+async fn login_account(
+    controller: State<'_, Controller>,
+    browser_id: Option<String>,
+) -> Result<(), String> {
+    controller.login_new(browser_id)
 }
 
 #[tauri::command]
-async fn cancel_login(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.controller.cancel(app).await
+async fn reauthenticate_account(
+    controller: State<'_, Controller>,
+    host: String,
+    login: String,
+) -> Result<(), String> {
+    controller.reauthenticate(host, login)
 }
 
 #[tauri::command]
-async fn get_gh_path(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(state.controller.get_gh_path().await)
+async fn sync_account_rename(
+    controller: State<'_, Controller>,
+    host: String,
+    login: String,
+) -> Result<(), String> {
+    controller.sync_rename(host, login)
 }
 
 #[tauri::command]
-async fn validate_gh_path(
-    state: State<'_, Arc<AppState>>,
-    path: String,
-) -> Result<settings::ValidationResult, String> {
-    Ok(state.controller.validate_gh_path(path).await)
+async fn cancel_login(controller: State<'_, Controller>) -> Result<(), String> {
+    controller.cancel_login()
 }
 
 #[tauri::command]
-async fn save_gh_path(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    path: String,
-) -> Result<String, String> {
-    state.controller.save_gh_path(app, path).await
+async fn reopen_authorization_page(controller: State<'_, Controller>) -> Result<(), String> {
+    controller.reopen_authorization_page()
 }
 
 #[tauri::command]
-async fn reset_gh_path(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    state.controller.reset_gh_path(app).await
+async fn set_account_browser(
+    controller: State<'_, Controller>,
+    host: String,
+    login: String,
+    browser_id: Option<String>,
+) -> Result<(), String> {
+    controller.set_account_browser(host, login, browser_id)
+}
+
+#[tauri::command]
+async fn open_account_in_browser(
+    controller: State<'_, Controller>,
+    host: String,
+    login: String,
+) -> Result<(), String> {
+    controller.open_account_in_browser(host, login)
+}
+
+#[tauri::command]
+async fn rescan_browsers(controller: State<'_, Controller>) -> Result<(), String> {
+    controller.rescan_browsers();
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_gh_path(controller: State<'_, Controller>) -> Result<String, String> {
+    Ok(controller.gh_path())
+}
+
+/// Native file dialog; the page never sees anything but the chosen path.
+#[tauri::command]
+async fn pick_gh_executable(app: AppHandle) -> Result<Option<String>, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("选择 gh.exe")
+        .add_filter("GitHub CLI (gh.exe)", &["exe"])
+        .pick_file(move |path| {
+            let _ = sender.send(path);
+        });
+    let picked = receiver
+        .await
+        .map_err(|_| "无法打开文件选择对话框".to_string())?;
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.display().to_string()))
+}
+
+#[tauri::command]
+async fn save_gh_path(controller: State<'_, Controller>, path: String) -> Result<String, String> {
+    controller.save_gh_path(path).await
+}
+
+#[tauri::command]
+async fn reset_gh_path(controller: State<'_, Controller>) -> Result<String, String> {
+    controller.reset_gh_path().await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let settings = GhExecutableSettings::load();
-            let process = GhProcess::new(settings);
-            let controller = AuthController::new(process);
-            let state = Arc::new(AppState {
-                controller: controller.clone(),
-            });
-            app.manage(state.clone());
-
-            let app_handle = app.handle().clone();
-            let controller_for_finished = controller.clone();
-            app.listen("gh-finished", move |event| {
-                let app = app_handle.clone();
-                let controller = controller_for_finished.clone();
-                let payload = event.payload().to_string();
-                tauri::async_runtime::spawn(async move {
-                    if let Ok(data) = serde_json::from_str::<FinishedPayload>(&payload) {
-                        controller
-                            .on_process_finished(app, data.operation, data.success, data.output)
-                            .await;
-                    }
-                });
-            });
-
-            let app_handle = app.handle().clone();
-            let controller_for_code = controller.clone();
-            app.listen("authorization-code", move |event| {
-                let app = app_handle.clone();
-                let controller = controller_for_code.clone();
-                let payload = event.payload().to_string();
-                tauri::async_runtime::spawn(async move {
-                    if let Ok(data) = serde_json::from_str::<CodePayload>(&payload) {
-                        controller.set_authorization_code(&app, data.code).await;
-                    }
-                });
-            });
-
-            let controller_for_boot = controller;
-            let app_handle = app.handle().clone();
+            let handle = app.handle().clone();
+            let emitter = app.handle().clone();
+            let controller = Controller::new(
+                GhCli,
+                Arc::new(DesktopPlatform { app: handle }),
+                GhExecutableSettings::load(),
+                MetaStore::load(),
+                Arc::new(move |snapshot| {
+                    let _ = emitter.emit("app-state", snapshot);
+                }),
+            );
+            app.manage(controller.clone());
             tauri::async_runtime::spawn(async move {
-                let _ = controller_for_boot.refresh(app_handle).await;
+                let _ = controller.refresh();
             });
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -138,26 +191,29 @@ pub fn run() {
             switch_account,
             logout_account,
             login_account,
+            reauthenticate_account,
+            sync_account_rename,
             cancel_login,
+            reopen_authorization_page,
+            set_account_browser,
+            open_account_in_browser,
+            rescan_browsers,
             get_gh_path,
-            validate_gh_path,
+            pick_gh_executable,
             save_gh_path,
             reset_gh_path
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FinishedPayload {
-    operation: String,
-    success: bool,
-    output: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodePayload {
-    code: String,
+    app.run(|handle, event| {
+        if let RunEvent::Exit = event {
+            // A pending `gh auth login` must not outlive the window: the user
+            // could still finish authorizing it in the browser later.
+            if let Some(controller) = handle.try_state::<Controller>() {
+                let controller = controller.inner().clone();
+                tauri::async_runtime::block_on(controller.shutdown());
+            }
+        }
+    });
 }

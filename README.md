@@ -6,10 +6,10 @@
 
 GithubDeck 是一款面向 Windows 的 GitHub CLI 多账号桌面管理器。它读取本机 GitHub CLI 已认证账号，并提供账号状态刷新、活动账号切换、浏览器设备登录、精确本地登出和自定义 `gh.exe` 路径设置。
 
-仓库同时维护两个功能对等的桌面实现：
+仓库包含两个桌面实现：
 
-- **Rust / Tauri 2 / React**：体积更小，提供便携 EXE、MSI 和 NSIS 安装程序，推荐普通用户使用。
-- **Python / PySide6**：提供单文件便携 EXE，适合需要 Python 实现或参与 Python 端开发的用户。
+- **Rust / Tauri 2 / React**（主实现）：体积更小，提供便携 EXE、MSI 和 NSIS 安装程序，推荐普通用户使用。
+- **Python / PySide6**：早期实现，提供单文件便携 EXE。它没有下面标注“Rust 版”的功能。
 
 ## 功能
 
@@ -20,23 +20,27 @@ GithubDeck 是一款面向 Windows 的 GitHub CLI 多账号桌面管理器。它
 - 二次确认后只登出明确选中的账号。
 - 配置并验证自定义 GitHub CLI 可执行文件。
 - 异步运行 GitHub CLI 操作，避免阻塞桌面界面。
+- Rust 版：显示每个账号令牌的权限（scopes），高风险权限标红。
+- Rust 版：为账号绑定所在的浏览器（精确到 Chrome/Edge 的用户配置或 Firefox 的 profile）；授权页在该浏览器中打开。
+- Rust 版：识别在 GitHub 上改过名的账号，显示新名字，并可把 GitHub CLI 的本机记录同步到新名字。
 
 ## 下载
 
-从项目的 `v0.2.0` Release 选择对应资产：
+从项目的 [Releases](https://github.com/just-liuyi/GithubDeck/releases) 页面选择对应资产。`v0.3.0` 提供 Rust 版：
 
 | 资产 | 用途 |
 | --- | --- |
-| `GithubDeck-Rust-v0.2.0-x64-setup.exe` | Rust 版 NSIS 安装程序，推荐普通用户使用 |
-| `GithubDeck-Rust-Portable-v0.2.0.exe` | Rust 版免安装便携程序 |
-| `GithubDeck-Rust-v0.2.0-x64.msi` | Rust 版 Windows Installer 安装包 |
-| `GithubDeck-Python-Portable-v0.2.0.exe` | Python/PySide6 单文件便携程序 |
-| `SHA256SUMS.txt` | 四个二进制资产的 SHA-256 校验值 |
+| `GithubDeck-Rust-v0.3.0-x64-setup.exe` | Rust 版 NSIS 安装程序，推荐普通用户使用 |
+| `GithubDeck-Rust-Portable-v0.3.0.exe` | Rust 版免安装便携程序 |
+| `GithubDeck-Rust-v0.3.0-x64.msi` | Rust 版 Windows Installer 安装包 |
+| `SHA256SUMS.txt` | 上述二进制资产的 SHA-256 校验值 |
+
+Python/PySide6 单文件便携程序 `GithubDeck-Python-Portable-v0.2.0.exe` 在 `v0.2.0` Release 中提供。
 
 两个实现均未进行商业代码签名，Windows SmartScreen 可能显示“未知发布者”。请只从本项目官方 Release 下载，并核对 SHA-256。
 
 ```powershell
-Get-FileHash .\GithubDeck-Rust-v0.2.0-x64-setup.exe -Algorithm SHA256
+Get-FileHash .\GithubDeck-Rust-v0.3.0-x64-setup.exe -Algorithm SHA256
 ```
 
 ## 系统要求
@@ -56,7 +60,7 @@ C:\Program Files\GitHub CLI\gh.exe
 
 1. 启动 GithubDeck，等待账号状态刷新。
 2. 选择非活动账号后，点击“切换到所选账号”。
-3. 点击“登录新账号”，在 GitHub 官方设备授权页输入界面显示的一次性验证码。
+3. 点击“登录新账号”（Rust 版会先让你选择浏览器），在 GitHub 官方设备授权页输入界面显示的一次性验证码。
 4. 如需移除本机认证，选择账号并点击“登出所选账号”，然后完成二次确认。
 
 登出只执行精确的本地 GitHub CLI 操作：

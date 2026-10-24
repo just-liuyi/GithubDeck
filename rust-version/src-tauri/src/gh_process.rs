@@ -1,393 +1,255 @@
-use crate::settings::{inherit_sanitized_env, GhExecutableSettings};
-use once_cell::sync::Lazy;
+//! Running GitHub CLI child processes.
+//!
+//! Every invocation reads stdout and stderr to the end on their own tasks, so
+//! no output is lost when the process exits, and stops the child on timeout or
+//! cancellation. The [`GhRunner`] trait lets the controller be tested without
+//! spawning real processes.
+
 use regex::bytes::Regex;
+use std::future::Future;
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use tokio::time::{timeout, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{sleep_until, Instant};
+use tokio_util::sync::CancellationToken;
 
-const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
-const SWITCH_TIMEOUT: Duration = Duration::from_secs(30);
-const LOGOUT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
+pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub const LOGOUT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const API_TIMEOUT: Duration = Duration::from_secs(15);
+pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// GitHub device codes expire after 15 minutes; gh exits by itself then.
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+
+const STDOUT_LIMIT: usize = 1_048_576;
 const LOGIN_BUFFER_LIMIT: usize = 4096;
-const STATUS_OUTPUT_LIMIT: usize = 1_048_576;
+/// After the child exits, how long to keep reading output still in the pipes.
+/// A grandchild that inherited a pipe could otherwise keep it open forever.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-static ANSI_ESCAPE_RE: Lazy<Regex> = Lazy::new(|| {
+/// Variables that would make gh use a token from the environment instead of
+/// the stored accounts, or launch a browser command of the caller's choosing.
+pub const SANITIZED_ENV_VARS: [&str; 5] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_BROWSER",
+];
+
+static ANSI_ESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))").expect("ansi regex")
 });
-static DEVICE_CODE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[A-Z0-9]{4}-[A-Z0-9]{4}").expect("device code regex"));
+static DEVICE_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Z0-9]{4}-[A-Z0-9]{4}").expect("device code regex"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operation {
-    Status,
-    Switch,
-    Logout,
-    Login,
-}
-
-impl Operation {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Status => "status",
-            Self::Switch => "switch",
-            Self::Logout => "logout",
-            Self::Login => "login",
-        }
-    }
-
-    fn timeout(self) -> Option<Duration> {
-        match self {
-            Self::Status => Some(STATUS_TIMEOUT),
-            Self::Switch => Some(SWITCH_TIMEOUT),
-            Self::Logout => Some(LOGOUT_TIMEOUT),
-            Self::Login => None,
-        }
-    }
+pub enum RunStatus {
+    Success,
+    Failed,
+    TimedOut,
+    Cancelled,
+    SpawnFailed,
 }
 
 #[derive(Debug)]
-struct ProcessState {
-    child: Option<Child>,
-    operation: Option<Operation>,
-    cancelled: bool,
-    login_buffer: Vec<u8>,
-    status_output: Vec<u8>,
-    code_reported: bool,
-    browser_open_confirmed: bool,
+pub struct RunOutput {
+    pub status: RunStatus,
+    pub stdout: Vec<u8>,
 }
 
-impl Default for ProcessState {
-    fn default() -> Self {
+impl RunOutput {
+    pub fn new(status: RunStatus, stdout: impl Into<Vec<u8>>) -> Self {
         Self {
-            child: None,
-            operation: None,
-            cancelled: false,
-            login_buffer: Vec::new(),
-            status_output: Vec::new(),
-            code_reported: false,
-            browser_open_confirmed: false,
+            status,
+            stdout: stdout.into(),
         }
     }
 }
 
-#[derive(Clone)]
-pub struct GhProcess {
-    settings: Arc<Mutex<GhExecutableSettings>>,
-    state: Arc<Mutex<ProcessState>>,
+pub struct RunRequest {
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    pub timeout: Duration,
+    /// Stops the child when cancelled.
+    pub cancel: Option<CancellationToken>,
+    /// Receives the first device authorization code found in the output.
+    pub device_code: Option<oneshot::Sender<String>>,
 }
 
-impl GhProcess {
-    pub fn new(settings: GhExecutableSettings) -> Self {
+impl RunRequest {
+    pub fn new(executable: impl Into<PathBuf>, args: &[&str], timeout: Duration) -> Self {
         Self {
-            settings: Arc::new(Mutex::new(settings)),
-            state: Arc::new(Mutex::new(ProcessState::default())),
+            executable: executable.into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            timeout,
+            cancel: None,
+            device_code: None,
         }
     }
+}
 
-    pub async fn settings_path(&self) -> String {
-        self.settings.lock().await.path_string()
+pub trait GhRunner: Send + Sync + 'static {
+    fn run(&self, request: RunRequest) -> impl Future<Output = RunOutput> + Send;
+}
+
+/// Runs the real GitHub CLI.
+pub struct GhCli;
+
+impl GhRunner for GhCli {
+    fn run(&self, request: RunRequest) -> impl Future<Output = RunOutput> + Send {
+        run_process(request)
     }
+}
 
-    pub async fn set_settings_path(&self, path: &str) -> Result<(), String> {
-        self.settings
-            .lock()
-            .await
-            .set_path(path)
-            .map_err(|error| error.to_string())
+pub fn sanitize_env(command: &mut std::process::Command) {
+    for name in SANITIZED_ENV_VARS {
+        command.env_remove(name);
     }
+}
 
-    pub async fn reset_settings_path(&self) -> Result<(), String> {
-        self.settings
-            .lock()
-            .await
-            .reset()
-            .map_err(|error| error.to_string())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+enum Event {
+    Chunk(Stream, Vec<u8>),
+    StreamsClosed,
+    Exited(bool),
+    Deadline,
+    Cancel,
+    DrainExpired,
+}
+
+pub async fn run_process(request: RunRequest) -> RunOutput {
+    let RunRequest {
+        executable,
+        args,
+        timeout,
+        cancel,
+        mut device_code,
+    } = request;
+    let cancel = cancel.unwrap_or_default();
+
+    let mut command = Command::new(&executable);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
+    sanitize_env(command.as_std_mut());
 
-    pub async fn executable_available(&self) -> bool {
-        self.settings.lock().await.executable_available()
+    let Ok(mut child) = command.spawn() else {
+        return RunOutput::new(RunStatus::SpawnFailed, Vec::new());
+    };
+
+    let (sender, mut receiver) = mpsc::channel(64);
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(pump(stdout, Stream::Stdout, sender.clone()));
     }
-
-    pub async fn busy(&self) -> bool {
-        self.state.lock().await.child.is_some()
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(pump(stderr, Stream::Stderr, sender.clone()));
     }
+    drop(sender);
 
-    pub async fn refresh(&self, app: AppHandle) -> Result<(), String> {
-        self.start(app, Operation::Status, &["auth", "status", "--json", "hosts"])
-            .await
-    }
+    let deadline = Instant::now() + timeout;
+    let mut drain_deadline: Option<Instant> = None;
+    let mut stdout = Vec::new();
+    let mut login_buffer = Vec::new();
+    let mut exited: Option<bool> = None;
+    let mut streams_open = true;
+    let mut stopping = false;
+    let mut timed_out = false;
+    let mut cancelled = false;
 
-    pub async fn switch(&self, app: AppHandle, host: &str, login: &str) -> Result<(), String> {
-        self.start(
-            app,
-            Operation::Switch,
-            &["auth", "switch", "--hostname", host, "--user", login],
-        )
-        .await
-    }
-
-    pub async fn logout(&self, app: AppHandle, host: &str, login: &str) -> Result<(), String> {
-        self.start(
-            app,
-            Operation::Logout,
-            &["auth", "logout", "--hostname", host, "--user", login],
-        )
-        .await
-    }
-
-    pub async fn login(&self, app: AppHandle) -> Result<(), String> {
-        self.start(
-            app,
-            Operation::Login,
-            &[
-                "auth",
-                "login",
-                "--hostname",
-                "github.com",
-                "--git-protocol",
-                "https",
-                "--web",
-            ],
-        )
-        .await
-    }
-
-    pub async fn cancel(&self) -> bool {
-        let mut state = self.state.lock().await;
-        if state.child.is_none() {
-            return false;
-        }
-        state.cancelled = true;
-        state.login_buffer.clear();
-        state.status_output.clear();
-        state.code_reported = false;
-        state.browser_open_confirmed = false;
-        if let Some(child) = state.child.as_mut() {
-            let _ = child.start_kill();
-        }
-        true
-    }
-
-    pub async fn shutdown(&self) {
-        let mut state = self.state.lock().await;
-        state.cancelled = true;
-        if let Some(mut child) = state.child.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        *state = ProcessState::default();
-    }
-
-    async fn start(
-        &self,
-        app: AppHandle,
-        operation: Operation,
-        arguments: &[&str],
-    ) -> Result<(), String> {
-        {
-            let state = self.state.lock().await;
-            if state.child.is_some() {
-                return Err("当前有操作正在进行".into());
+    while streams_open || exited.is_none() {
+        let event = tokio::select! {
+            biased;
+            _ = cancel.cancelled(), if !stopping => Event::Cancel,
+            _ = sleep_until(deadline), if !stopping => Event::Deadline,
+            message = receiver.recv(), if streams_open => match message {
+                Some((stream, data)) => Event::Chunk(stream, data),
+                None => Event::StreamsClosed,
+            },
+            status = child.wait(), if exited.is_none() => {
+                Event::Exited(status.map(|status| status.success()).unwrap_or(false))
             }
-        }
-
-        let executable = {
-            let settings = self.settings.lock().await;
-            let path = settings.path();
-            if !path.is_file() {
-                return Err("未找到 GitHub CLI，请在设置中指定有效的 gh.exe".into());
+            _ = sleep_until(drain_deadline.unwrap_or(deadline)), if drain_deadline.is_some() => {
+                Event::DrainExpired
             }
-            path
         };
 
-        let mut command = Command::new(&executable);
-        command
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        inherit_sanitized_env(command.as_std_mut());
-
-        let child = command
-            .spawn()
-            .map_err(|_| "无法启动 GitHub CLI".to_string())?;
-
-        {
-            let mut state = self.state.lock().await;
-            state.child = Some(child);
-            state.operation = Some(operation);
-            state.cancelled = false;
-            state.login_buffer.clear();
-            state.status_output.clear();
-            state.code_reported = false;
-            state.browser_open_confirmed = false;
-        }
-
-        let process = self.clone();
-        tokio::spawn(async move {
-            process.drive_operation(app, operation).await;
-        });
-        Ok(())
-    }
-
-    async fn drive_operation(&self, app: AppHandle, operation: Operation) {
-        let started = Instant::now();
-        let mut stdout_buf = [0u8; 1024];
-        let mut stderr_buf = [0u8; 1024];
-
-        loop {
-            if let Some(limit) = operation.timeout() {
-                if started.elapsed() >= limit {
-                    let _ = self.cancel().await;
+        match event {
+            Event::Cancel => {
+                cancelled = true;
+                stopping = true;
+                let _ = child.start_kill();
+            }
+            Event::Deadline => {
+                timed_out = true;
+                stopping = true;
+                let _ = child.start_kill();
+            }
+            Event::Chunk(stream, data) => {
+                if stream == Stream::Stdout {
+                    append_limited(&mut stdout, &data, STDOUT_LIMIT);
                 }
-            }
-
-            let mut state = self.state.lock().await;
-            if state.child.is_none() {
-                return;
-            }
-
-            let mut made_progress = false;
-            let mut stdout_chunk: Option<Vec<u8>> = None;
-            let mut stderr_chunk: Option<Vec<u8>> = None;
-
-            if let Some(child) = state.child.as_mut() {
-                if let Some(stdout) = child.stdout.as_mut() {
-                    match timeout(Duration::from_millis(50), stdout.read(&mut stdout_buf)).await {
-                        Ok(Ok(0)) => {}
-                        Ok(Ok(n)) => {
-                            made_progress = true;
-                            stdout_chunk = Some(stdout_buf[..n].to_vec());
+                if device_code.is_some() && !stopping {
+                    append_limited(&mut login_buffer, &data, LOGIN_BUFFER_LIMIT);
+                    if let Some(code) = extract_device_code(&login_buffer) {
+                        if let Some(sender) = device_code.take() {
+                            let _ = sender.send(code);
                         }
-                        Ok(Err(_)) | Err(_) => {}
                     }
                 }
             }
-
-            if let Some(chunk) = stdout_chunk.as_deref() {
-                if operation == Operation::Login {
-                    Self::consume_login_output(&mut state, chunk, &app);
-                } else if operation == Operation::Status {
-                    append_limited(&mut state.status_output, chunk, STATUS_OUTPUT_LIMIT);
-                }
+            Event::StreamsClosed => streams_open = false,
+            Event::Exited(success) => {
+                exited = Some(success);
+                drain_deadline = Some(Instant::now() + DRAIN_GRACE);
             }
-
-            if let Some(child) = state.child.as_mut() {
-                if let Some(stderr) = child.stderr.as_mut() {
-                    match timeout(Duration::from_millis(50), stderr.read(&mut stderr_buf)).await {
-                        Ok(Ok(0)) => {}
-                        Ok(Ok(n)) => {
-                            made_progress = true;
-                            stderr_chunk = Some(stderr_buf[..n].to_vec());
-                        }
-                        Ok(Err(_)) | Err(_) => {}
-                    }
-                }
-            }
-
-            if let Some(chunk) = stderr_chunk.as_deref() {
-                if operation == Operation::Login {
-                    Self::consume_login_output(&mut state, chunk, &app);
-                }
-            }
-
-            if operation == Operation::Login
-                && state.code_reported
-                && !state.browser_open_confirmed
-                && !state.cancelled
-            {
-                let browser_open_confirmed = if let Some(child) = state.child.as_mut() {
-                    if let Some(stdin) = child.stdin.as_mut() {
-                        stdin.write_all(b"\n").await.is_ok()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if browser_open_confirmed {
-                    state.browser_open_confirmed = true;
-                }
-            }
-
-            let wait_result = match state.child.as_mut() {
-                Some(child) => child.try_wait(),
-                None => return,
-            };
-
-            match wait_result {
-                Ok(Some(status)) => {
-                    let cancelled = state.cancelled;
-                    let output = if operation == Operation::Status {
-                        state.status_output.clone()
-                    } else {
-                        Vec::new()
-                    };
-                    state.child = None;
-                    state.operation = None;
-                    state.login_buffer.clear();
-                    state.status_output.clear();
-                    state.code_reported = false;
-                    state.browser_open_confirmed = false;
-                    let success = status.success() && !cancelled;
-                    drop(state);
-                    let _ = app.emit(
-                        "gh-finished",
-                        ProcessFinishedEvent {
-                            operation: operation.as_str().to_string(),
-                            success,
-                            output: String::from_utf8_lossy(&output).into_owned(),
-                        },
-                    );
-                    return;
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    state.child = None;
-                    state.operation = None;
-                    drop(state);
-                    let _ = app.emit(
-                        "gh-finished",
-                        ProcessFinishedEvent {
-                            operation: operation.as_str().to_string(),
-                            success: false,
-                            output: String::new(),
-                        },
-                    );
-                    return;
-                }
-            }
-
-            drop(state);
-            if !made_progress {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
+            Event::DrainExpired => break,
         }
     }
 
-    fn consume_login_output(state: &mut ProcessState, data: &[u8], app: &AppHandle) {
-        if state.cancelled || state.code_reported || data.is_empty() {
-            return;
-        }
-        append_limited(&mut state.login_buffer, data, LOGIN_BUFFER_LIMIT);
-        let clean = ANSI_ESCAPE_RE.replace_all(&state.login_buffer, b"");
-        if let Some(code) = find_device_code(&clean) {
-            state.code_reported = true;
-            let _ = app.emit(
-                "authorization-code",
-                AuthorizationCodeEvent { code },
-            );
+    let status = if cancelled {
+        RunStatus::Cancelled
+    } else if timed_out {
+        RunStatus::TimedOut
+    } else if exited == Some(true) {
+        RunStatus::Success
+    } else {
+        RunStatus::Failed
+    };
+    RunOutput::new(status, stdout)
+}
+
+async fn pump<R: AsyncRead + Unpin>(
+    mut reader: R,
+    stream: Stream,
+    sender: mpsc::Sender<(Stream, Vec<u8>)>,
+) {
+    let mut buffer = vec![0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if sender.send((stream, buffer[..read].to_vec())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -400,49 +262,12 @@ fn append_limited(buffer: &mut Vec<u8>, data: &[u8], limit: usize) {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProcessFinishedEvent {
-    operation: String,
-    success: bool,
-    output: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthorizationCodeEvent {
-    code: String,
-}
-
-pub fn logout_arguments(host: &str, login: &str) -> Vec<String> {
-    vec![
-        "auth".into(),
-        "logout".into(),
-        "--hostname".into(),
-        host.into(),
-        "--user".into(),
-        login.into(),
-    ]
-}
-
-pub fn login_arguments() -> Vec<String> {
-    vec![
-        "auth".into(),
-        "login".into(),
-        "--hostname".into(),
-        "github.com".into(),
-        "--git-protocol".into(),
-        "https".into(),
-        "--web".into(),
-    ]
-}
-
-fn find_device_code(input: &[u8]) -> Option<String> {
-    DEVICE_CODE_RE.find_iter(input).find_map(|candidate| {
-        let start = candidate.start();
-        let end = candidate.end();
-        let valid_left = start == 0 || !is_device_code_character(input[start - 1]);
-        let valid_right = end == input.len() || !is_device_code_character(input[end]);
+pub fn extract_device_code(input: &[u8]) -> Option<String> {
+    let clean = ANSI_ESCAPE_RE.replace_all(input, b"");
+    DEVICE_CODE_RE.find_iter(&clean).find_map(|candidate| {
+        let (start, end) = (candidate.start(), candidate.end());
+        let valid_left = start == 0 || !is_device_code_character(clean[start - 1]);
+        let valid_right = end == clean.len() || !is_device_code_character(clean[end]);
         if !valid_left || !valid_right {
             return None;
         }
@@ -456,45 +281,9 @@ fn is_device_code_character(byte: u8) -> bool {
     byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-'
 }
 
-pub fn extract_device_code(input: &[u8]) -> Option<String> {
-    let clean = ANSI_ESCAPE_RE.replace_all(input, b"");
-    find_device_code(&clean)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn logout_uses_exact_account_arguments() {
-        assert_eq!(
-            logout_arguments("github.com", "alice"),
-            vec![
-                "auth",
-                "logout",
-                "--hostname",
-                "github.com",
-                "--user",
-                "alice"
-            ]
-        );
-    }
-
-    #[test]
-    fn login_uses_web_flow_arguments() {
-        assert_eq!(
-            login_arguments(),
-            vec![
-                "auth",
-                "login",
-                "--hostname",
-                "github.com",
-                "--git-protocol",
-                "https",
-                "--web"
-            ]
-        );
-    }
 
     #[test]
     fn device_code_parser_handles_ansi_and_rejects_bad_formats() {
@@ -507,8 +296,110 @@ mod tests {
     }
 
     #[test]
-    fn executable_path_type_is_pathbuf() {
-        let path = std::path::PathBuf::from(r"C:\Program Files\GitHub CLI\gh.exe");
-        assert!(path.to_string_lossy().contains("gh.exe"));
+    fn token_variables_are_removed_not_just_reassigned() {
+        let mut command = std::process::Command::new("gh");
+        sanitize_env(&mut command);
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for name in SANITIZED_ENV_VARS {
+            assert!(removed.iter().any(|key| key == name), "{name} not removed");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_executable_reports_spawn_failure() {
+        let output = run_process(RunRequest::new(
+            r"Z:\definitely\missing\gh.exe",
+            &["--version"],
+            Duration::from_secs(5),
+        ))
+        .await;
+        assert_eq!(output.status, RunStatus::SpawnFailed);
+    }
+
+    #[cfg(windows)]
+    mod windows {
+        use super::super::*;
+        use std::path::Path;
+
+        fn script(dir: &Path, body: &str) -> RunRequest {
+            let path = dir.join("fake.cmd");
+            std::fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
+            let mut request = RunRequest::new("cmd.exe", &["/d", "/c"], Duration::from_secs(20));
+            request.args.push(path.display().to_string());
+            request
+        }
+
+        #[tokio::test]
+        async fn reads_large_output_completely_every_time() {
+            let dir = tempfile::tempdir().unwrap();
+            let payload: String = (0..4000)
+                .map(|index| format!("{{\"login\":\"user{index}\"}},"))
+                .collect();
+            let data = dir.path().join("status.json");
+            std::fs::write(&data, &payload).unwrap();
+            for _ in 0..10 {
+                let request = script(dir.path(), &format!("type \"{}\"", data.display()));
+                let output = run_process(request).await;
+                assert_eq!(output.status, RunStatus::Success);
+                assert_eq!(output.stdout.len(), payload.len());
+            }
+        }
+
+        #[tokio::test]
+        async fn reports_non_zero_exit_as_failure() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = run_process(script(dir.path(), "exit /b 3")).await;
+            assert_eq!(output.status, RunStatus::Failed);
+        }
+
+        #[tokio::test]
+        async fn stops_the_child_on_timeout() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut request = script(dir.path(), "ping -n 5 127.0.0.1 >nul 2>&1");
+            request.timeout = Duration::from_millis(300);
+            let started = std::time::Instant::now();
+            let output = run_process(request).await;
+            assert_eq!(output.status, RunStatus::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
+
+        #[tokio::test]
+        async fn cancellation_stops_the_child_and_reports_cancelled() {
+            let dir = tempfile::tempdir().unwrap();
+            let token = CancellationToken::new();
+            let mut request = script(dir.path(), "ping -n 5 127.0.0.1 >nul 2>&1");
+            request.cancel = Some(token.clone());
+            let canceller = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                token.cancel();
+            });
+            let started = std::time::Instant::now();
+            let output = run_process(request).await;
+            canceller.await.unwrap();
+            assert_eq!(output.status, RunStatus::Cancelled);
+            assert!(started.elapsed() < Duration::from_secs(10));
+        }
+
+        #[tokio::test]
+        async fn reports_device_code_from_stderr_while_running() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut request = script(
+                dir.path(),
+                "echo ! First copy your one-time code: AB12-CD34 1>&2\r\nping -n 3 127.0.0.1 >nul 2>&1",
+            );
+            let (sender, receiver) = oneshot::channel();
+            request.device_code = Some(sender);
+            let run = tokio::spawn(run_process(request));
+            let code = tokio::time::timeout(Duration::from_secs(10), receiver)
+                .await
+                .expect("code before exit")
+                .unwrap();
+            assert_eq!(code, "AB12-CD34");
+            assert_eq!(run.await.unwrap().status, RunStatus::Success);
+        }
     }
 }

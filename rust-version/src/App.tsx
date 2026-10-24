@@ -1,188 +1,87 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import AccountCard from "./components/AccountCard";
+import LoginDialog from "./components/LoginDialog";
+import SettingsDialog, { GITHUB_CLI_RELEASES_URL } from "./components/SettingsDialog";
+import { type Account, type AppState, type LoginView, accountKey, displayName } from "./types";
 import "./App.css";
-
-type AuthState = "success" | "failure" | "unknown";
-
-type Account = {
-  host: string;
-  login: string;
-  active: boolean;
-  state: AuthState;
-};
-
-type UiMessage = {
-  text: string;
-  isError: boolean;
-};
-
-type AppState = {
-  accounts: Account[];
-  busy: boolean;
-  loginActive: boolean;
-  authorizationCode: string;
-  message: UiMessage;
-  ghPath: string;
-};
-
-const DEVICE_LOGIN_URL = "https://github.com/login/device";
-const GITHUB_CLI_RELEASES_URL = "https://github.com/cli/cli/releases/";
-const AUTH_STATE_LABELS: Record<AuthState, string> = {
-  success: "已认证",
-  failure: "需重新认证",
-  unknown: "认证状态未知",
-};
 
 const emptyState: AppState = {
   accounts: [],
   busy: false,
-  loginActive: false,
-  authorizationCode: "",
+  login: null,
   message: { text: "准备就绪", isError: false },
   ghPath: "",
+  browsers: [],
+  lastLoginBrowser: null,
 };
 
-function initials(login: string): string {
-  const parts = login.replace(/[-_]/g, " ").split(/\s+/).filter(Boolean);
-  if (parts.length > 1) {
-    return (parts[0][0] + parts[1][0]).toUpperCase();
+function loginTitle(login: LoginView): string {
+  switch (login.purpose) {
+    case "reauth":
+      return `重新认证 ${login.targetLogin ?? ""}`;
+    case "rename":
+      return `同步改名：请授权原 ${login.targetLogin ?? ""} 账号`;
+    default:
+      return "在浏览器中完成 GitHub 授权";
   }
-  return login.slice(0, 2).toUpperCase();
 }
 
 export default function App() {
   const [state, setState] = useState<AppState>(emptyState);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsPath, setSettingsPath] = useState("");
-  const [settingsStatus, setSettingsStatus] = useState("选择 gh.exe 后可校验并保存");
-  const [settingsState, setSettingsState] = useState<"idle" | "validating" | "success" | "error">(
-    "idle",
+  const [loginDialogOpen, setLoginDialogOpen] = useState(false);
+
+  const selectedAccount = useMemo(
+    () => state.accounts.find((account) => accountKey(account) === selectedKey) ?? null,
+    [selectedKey, state.accounts],
   );
-  const [settingsBusy, setSettingsBusy] = useState(false);
-
-  const selectedAccount = useMemo(() => {
-    if (!selectedKey) return null;
-    return (
-      state.accounts.find((account) => `${account.host}|${account.login}` === selectedKey) ?? null
-    );
-  }, [selectedKey, state.accounts]);
-
-  const applyState = useCallback((next: AppState) => {
-    setState(next);
-    setSelectedKey((current) => {
-      if (!current) return current;
-      const stillThere = next.accounts.some(
-        (account) => `${account.host}|${account.login}` === current,
-      );
-      return stillThere ? current : null;
-    });
-  }, []);
 
   useEffect(() => {
-    let unlistenState: (() => void) | undefined;
-    let unlistenCode: (() => void) | undefined;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
 
     (async () => {
-      try {
-        const initial = await invoke<AppState>("get_state");
-        applyState(initial);
-        setSettingsPath(initial.ghPath);
-      } catch {
-        // ignore bootstrap errors; events will update later
+      const stop = await listen<AppState>("app-state", (event) => setState(event.payload));
+      if (disposed) {
+        stop();
+        return;
       }
-
-      unlistenState = await listen<AppState>("app-state", (event) => {
-        applyState(event.payload);
-        setSettingsPath(event.payload.ghPath);
-      });
-      unlistenCode = await listen<{ code: string }>("authorization-code", (event) => {
-        setState((current) => ({
-          ...current,
-          authorizationCode: event.payload.code,
-          loginActive: true,
-        }));
-      });
+      unlisten = stop;
+      try {
+        setState(await invoke<AppState>("get_state"));
+      } catch {
+        // The backend pushes a state on every change; keep the placeholder.
+      }
     })();
 
     return () => {
-      unlistenState?.();
-      unlistenCode?.();
+      disposed = true;
+      unlisten?.();
     };
-  }, [applyState]);
+  }, []);
+
+  function showMessage(text: string, isError: boolean) {
+    setState((current) => ({ ...current, message: { text, isError } }));
+  }
 
   async function runCommand(command: string, args?: Record<string, unknown>) {
     try {
       await invoke(command, args);
     } catch (error) {
-      const text = typeof error === "string" ? error : "操作失败";
-      setState((current) => ({
-        ...current,
-        message: { text, isError: true },
-      }));
+      showMessage(typeof error === "string" ? error : "操作失败", true);
     }
   }
 
   async function copyText(text: string, successMessage: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setState((current) => ({
-        ...current,
-        message: { text: successMessage, isError: false },
-      }));
+      showMessage(successMessage, false);
     } catch {
-      setState((current) => ({
-        ...current,
-        message: { text: "无法访问系统剪贴板，请稍后重试", isError: true },
-      }));
-    }
-  }
-
-  async function confirmLogout(account: Account) {
-    const ok = window.confirm(
-      `确定要从本机 GitHub CLI 登出 ${account.login}（${account.host}）吗？\n\n这只会移除本机保存的认证配置，不会撤销 GitHub 端的 OAuth 授权。`,
-    );
-    if (!ok) return;
-    await runCommand("logout_account", { host: account.host, login: account.login });
-  }
-
-  async function openSettings() {
-    try {
-      const path = await invoke<string>("get_gh_path");
-      setSettingsPath(path);
-    } catch {
-      // keep current path
-    }
-    setSettingsStatus("选择 gh.exe 后可校验并保存");
-    setSettingsState("idle");
-    setSettingsOpen(true);
-  }
-
-  async function validateAndSave(path: string) {
-    setSettingsBusy(true);
-    setSettingsState("validating");
-    setSettingsStatus("正在校验 GitHub CLI…");
-    try {
-      const result = await invoke<{ valid: boolean; message: string }>("validate_gh_path", {
-        path,
-      });
-      if (!result.valid) {
-        setSettingsState("error");
-        setSettingsStatus(result.message);
-        return;
-      }
-      const saved = await invoke<string>("save_gh_path", { path });
-      setSettingsPath(saved);
-      setSettingsState("success");
-      setSettingsStatus("GitHub CLI 校验通过，路径已保存");
-      setSettingsOpen(false);
-    } catch (error) {
-      setSettingsState("error");
-      setSettingsStatus(typeof error === "string" ? error : "保存失败");
-    } finally {
-      setSettingsBusy(false);
+      showMessage("无法访问系统剪贴板，请稍后重试", true);
     }
   }
 
@@ -190,309 +89,193 @@ export default function App() {
     try {
       await openUrl(GITHUB_CLI_RELEASES_URL);
     } catch {
-      setState((current) => ({
-        ...current,
-        message: {
-          text: "无法打开 GitHub CLI 官方发布页，请稍后重试",
-          isError: true,
-        },
-      }));
+      showMessage("无法打开 GitHub CLI 官方发布页，请稍后重试", true);
     }
   }
 
-  async function restoreDefault() {
-    setSettingsBusy(true);
-    setSettingsState("validating");
-    setSettingsStatus("正在恢复默认路径…");
-    try {
-      const path = await invoke<string>("reset_gh_path");
-      setSettingsPath(path);
-      setSettingsState("success");
-      setSettingsStatus("已恢复默认 GitHub CLI 路径");
-      setSettingsOpen(false);
-    } catch (error) {
-      setSettingsState("error");
-      setSettingsStatus(typeof error === "string" ? error : "恢复默认失败");
-    } finally {
-      setSettingsBusy(false);
-    }
+  function target(account: Account) {
+    return { host: account.host, login: account.login };
   }
 
-  function onPickGhExe() {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".exe";
-    input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return;
-      const anyFile = file as File & { path?: string };
-      const candidate = anyFile.path || file.name;
-      setSettingsPath(candidate);
-    };
-    input.click();
+  function confirmLogout(account: Account) {
+    const ok = window.confirm(
+      `确定要从本机 GitHub CLI 登出 ${displayName(account)}（${account.host}）吗？\n\n这只会移除本机保存的认证配置，不会撤销 GitHub 端的 OAuth 授权。`,
+    );
+    if (ok) void runCommand("logout_account", target(account));
   }
 
-  const switchEnabled = !state.busy && selectedAccount !== null && !selectedAccount.active;
-  const logoutEnabled = !state.busy && selectedAccount !== null;
+  function confirmSyncRename(account: Account) {
+    const ok = window.confirm(
+      `同步改名：GitHub CLI 将以新名称 ${account.githubLogin} 保存这个账号。\n\n` +
+        `1. 将在${account.browser ? ` ${account.browser.label} ` : "系统默认浏览器"}中重新授权，请确认浏览器里登录的是该账号；\n` +
+        `2. 确认授权的是同一个 GitHub 账号后，移除旧记录 ${account.login}。\n\n` +
+        "如果授权的是其他账号，旧记录会保留。",
+    );
+    if (ok) void runCommand("sync_account_rename", target(account));
+  }
+
+  const { busy, login } = state;
+  const switchEnabled = !busy && selectedAccount !== null && !selectedAccount.active;
+  const logoutEnabled = !busy && selectedAccount !== null;
 
   return (
-    <div className="main-container" id="mainContainer">
-      <header className="app-header" id="appHeader">
-        <img className="app-mark" id="appMark" src="/favicon.png" alt="" />
-        <div className="app-title" id="appTitle">
-          GithubDeck
-        </div>
+    <div className="main-container">
+      <header className="app-header">
+        <img className="app-mark" src="/favicon.png" alt="" />
+        <div className="app-title">GithubDeck</div>
       </header>
 
       <main className="content">
-        <section className="page-header" id="pageHeader">
+        <section className="page-header">
           <div>
-            <h1 className="page-title" id="pageTitle">
-              GitHub 账号
-            </h1>
-            <p className="page-description" id="pageDescription">
-              管理本机 GitHub CLI 中已认证的账号
-            </p>
+            <h1 className="page-title">GitHub 账号</h1>
+            <p className="page-description">管理本机 GitHub CLI 中已认证的账号</p>
           </div>
           <div className="page-actions">
-            <button
-              id="refreshButton"
-              disabled={state.busy}
-              onClick={() => runCommand("refresh_accounts")}
-            >
+            <button type="button" disabled={busy} onClick={() => runCommand("refresh_accounts")}>
               刷新
             </button>
-            <button
-              id="settingsButton"
-              disabled={state.busy}
-              onClick={openSettings}
-              title="GitHub CLI 设置"
-            >
+            <button type="button" disabled={busy} onClick={() => setSettingsOpen(true)}>
               GitHub CLI 设置
             </button>
           </div>
         </section>
 
-        <section className="account-section" id="accountSection">
+        <section className="account-section">
           <div className="account-heading">
-            <span className="account-section-label" id="accountSectionLabel">
-              已认证账号
-            </span>
-            <span className="account-count-label" id="accountCountLabel">
-              {state.accounts.length} 个账号
-            </span>
+            <span className="account-section-label">已认证账号</span>
+            <span className="account-count-label">{state.accounts.length} 个账号</span>
           </div>
-          <div className={`account-list ${state.busy ? "disabled" : ""}`} id="accountList">
+          <div className={`account-list ${busy ? "disabled" : ""}`} role="list">
             {state.accounts.length === 0 ? (
               <div className="empty-accounts">暂无账号，可点击“登录新账号”添加</div>
             ) : (
-              state.accounts.map((account) => {
-                const key = `${account.host}|${account.login}`;
-                const selected = selectedKey === key;
-                return (
-                  <button
-                    type="button"
-                    key={key}
-                    className={`account-card ${selected ? "selected" : ""} ${
-                      account.active ? "active" : ""
-                    }`}
-                    disabled={state.busy}
-                    onClick={() => setSelectedKey(key)}
-                  >
-                    <div
-                      className={`account-accent ${account.active ? "active" : ""}`}
-                      id="accountAccent"
-                    />
-                    <div className="account-avatar" id="accountAvatar">
-                      {initials(account.login)}
-                    </div>
-                    <div className="account-copy">
-                      <div className="account-login" id="accountLogin">
-                        {account.login}
-                      </div>
-                      <div className="account-meta" id="accountMeta">
-                        {account.host} · {AUTH_STATE_LABELS[account.state]}
-                      </div>
-                    </div>
-                    <div
-                      className={`account-badge ${account.active ? "active" : ""} ${
-                        account.state === "failure" ? "needs-login" : ""
-                      }`}
-                      id="accountBadge"
-                    >
-                      {account.active ? "当前账号" : AUTH_STATE_LABELS[account.state]}
-                    </div>
-                  </button>
-                );
-              })
+              state.accounts.map((account) => (
+                <AccountCard
+                  key={accountKey(account)}
+                  account={account}
+                  selected={selectedKey === accountKey(account)}
+                  busy={busy}
+                  browsers={state.browsers}
+                  onSelect={() =>
+                    setSelectedKey((current) =>
+                      current === accountKey(account) ? null : accountKey(account),
+                    )
+                  }
+                  onSyncRename={() => confirmSyncRename(account)}
+                  onReauthenticate={() => runCommand("reauthenticate_account", target(account))}
+                  onSetBrowser={(browserId) =>
+                    runCommand("set_account_browser", { ...target(account), browserId })
+                  }
+                  onOpenInBrowser={() => runCommand("open_account_in_browser", target(account))}
+                />
+              ))
             )}
           </div>
         </section>
 
-        {state.loginActive && state.authorizationCode ? (
-          <section className="authorization-widget" id="authorizationWidget">
-            <div className="authorization-title" id="authorizationTitle">
-              在浏览器中完成 GitHub 授权
-            </div>
-            <p className="authorization-description" id="authorizationDescription">
-              打开官方设备授权页并输入一次性授权码。应用不会读取或保存你的 Token。
+        {login ? (
+          <section className="authorization-widget" aria-label="授权进度">
+            <div className="authorization-title">{loginTitle(login)}</div>
+            <p className="authorization-description">
+              {login.code
+                ? `授权页已在 ${login.browserLabel} 打开，输入下方一次性授权码即可。应用不会读取或保存你的 Token。`
+                : "正在向 GitHub 申请一次性授权码…"}
             </p>
-            <div className="auth-row">
-              <label>授权网址</label>
-              <input
-                id="authorizationUrl"
-                readOnly
-                value={DEVICE_LOGIN_URL}
-                className="authorization-url"
-              />
-              <button
-                id="copyUrlButton"
-                onClick={() => copyText(DEVICE_LOGIN_URL, "授权网址已复制")}
-              >
-                复制网址
-              </button>
-            </div>
-            <div className="auth-row">
-              <label>授权码</label>
-              <input
-                id="authorizationCode"
-                readOnly
-                value={state.authorizationCode}
-                className="authorization-code"
-              />
-              <button
-                id="copyCodeButton"
-                onClick={() => copyText(state.authorizationCode, "授权码已复制")}
-              >
-                复制授权码
+            {login.code ? (
+              <>
+                <div className="auth-row">
+                  <label htmlFor="authorizationCode">授权码</label>
+                  <input
+                    id="authorizationCode"
+                    readOnly
+                    value={login.code}
+                    className="authorization-code"
+                  />
+                  <button type="button" onClick={() => copyText(login.code, "授权码已复制")}>
+                    复制授权码
+                  </button>
+                </div>
+                <div className="auth-row">
+                  <label htmlFor="authorizationUrl">授权网址</label>
+                  <input id="authorizationUrl" readOnly value={login.url} />
+                  <div className="auth-row-actions">
+                    <button type="button" onClick={() => copyText(login.url, "授权网址已复制")}>
+                      复制网址
+                    </button>
+                    <button type="button" onClick={() => runCommand("reopen_authorization_page")}>
+                      重新打开
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : null}
+            <div className="authorization-actions">
+              <button type="button" className="danger" onClick={() => runCommand("cancel_login")}>
+                取消登录
               </button>
             </div>
           </section>
         ) : null}
 
-        <section className="bottom-actions" id="bottomActions">
+        <section className="bottom-actions">
           <button
-            id="switchButton"
+            type="button"
             disabled={!switchEnabled}
-            onClick={() => {
-              if (!selectedAccount) return;
-              runCommand("switch_account", {
-                host: selectedAccount.host,
-                login: selectedAccount.login,
-              });
-            }}
+            onClick={() => selectedAccount && runCommand("switch_account", target(selectedAccount))}
           >
             切换到所选账号
           </button>
           <button
-            id="logoutButton"
+            type="button"
             className="danger"
             disabled={!logoutEnabled}
-            onClick={() => {
-              if (!selectedAccount) return;
-              confirmLogout(selectedAccount);
-            }}
+            onClick={() => selectedAccount && confirmLogout(selectedAccount)}
           >
             登出所选账号
           </button>
           <div className="spacer" />
-          {state.loginActive ? (
-            <button
-              id="cancelButton"
-              className="danger"
-              onClick={() => runCommand("cancel_login")}
-            >
-              取消登录
-            </button>
-          ) : null}
           <button
-            id="loginButton"
+            type="button"
             className="primary"
-            disabled={state.busy}
-            onClick={() => runCommand("login_account")}
+            disabled={busy}
+            onClick={() => setLoginDialogOpen(true)}
           >
             登录新账号
           </button>
         </section>
       </main>
 
-      <footer className="status-bar" id="statusBar">
-        <span
-          className={`status-dot ${state.message.isError ? "error" : ""}`}
-          id="statusDot"
-        >
-          ●
-        </span>
+      <footer className="status-bar">
+        <span className={`status-dot ${state.message.isError ? "error" : ""}`}>●</span>
         <span
           className={`status-label ${state.message.isError ? "error" : ""}`}
-          id="statusLabel"
+          title={state.message.text}
         >
           {state.message.text}
         </span>
-        <span className="status-version" id="statusVersion">
-          GitHub CLI
-        </span>
+        <span className="status-version">GitHub CLI</span>
       </footer>
 
       {settingsOpen ? (
-        <div className="dialog-backdrop" role="dialog" aria-modal="true">
-          <div className="dialog-container" id="dialogContainer">
-            <div className="dialog-header" id="ghSettingsHeader">
-              <h2 className="dialog-title" id="dialogTitle">
-                GitHub CLI 设置
-              </h2>
-              <p className="dialog-description" id="dialogDescription">
-                指定本机 gh.exe 路径。保存前会校验文件名与版本输出。
-              </p>
-            </div>
-            <div className="settings-card" id="ghSettingsPathCard">
-              <label>当前路径</label>
-              <input
-                value={settingsPath}
-                onChange={(event) => setSettingsPath(event.target.value)}
-                spellCheck={false}
-              />
-              <div className="settings-actions">
-                <button disabled={settingsBusy} onClick={onPickGhExe}>
-                  选择 gh.exe
-                </button>
-                <button disabled={settingsBusy} onClick={restoreDefault}>
-                  恢复默认
-                </button>
-              </div>
-              <div className={`settings-status ${settingsState}`} id="ghSettingsStatus">
-                {settingsStatus}
-              </div>
-            </div>
-            <div className="settings-card" id="ghSettingsHelpCard">
-              <a
-                className="source-label source-link"
-                id="ghSourceLabel"
-                href={GITHUB_CLI_RELEASES_URL}
-                onClick={(event) => {
-                  event.preventDefault();
-                  void openGithubCliReleases();
-                }}
-              >
-                官方发布页：{GITHUB_CLI_RELEASES_URL}
-              </a>
-              <div className="source-label">测试安装包：gh_2.96.0_windows_amd64.msi</div>
-            </div>
-            <div className="dialog-actions">
-              <button disabled={settingsBusy} onClick={() => setSettingsOpen(false)}>
-                取消
-              </button>
-              <button
-                id="saveButton"
-                className="primary"
-                disabled={settingsBusy || !settingsPath.trim()}
-                onClick={() => validateAndSave(settingsPath.trim())}
-              >
-                保存
-              </button>
-            </div>
-          </div>
-        </div>
+        <SettingsDialog
+          initialPath={state.ghPath}
+          onClose={() => setSettingsOpen(false)}
+          onOpenReleases={() => void openGithubCliReleases()}
+        />
+      ) : null}
+
+      {loginDialogOpen ? (
+        <LoginDialog
+          browsers={state.browsers}
+          initialBrowser={state.lastLoginBrowser}
+          onRescan={() => runCommand("rescan_browsers")}
+          onCancel={() => setLoginDialogOpen(false)}
+          onStart={(browserId) => {
+            setLoginDialogOpen(false);
+            void runCommand("login_account", { browserId });
+          }}
+        />
       ) : null}
     </div>
   );
