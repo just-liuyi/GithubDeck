@@ -6,9 +6,10 @@
 
 GithubDeck 是一款面向 Windows 的 GitHub CLI 多账号桌面管理器。它读取本机 GitHub CLI 已认证账号，并提供账号状态刷新、活动账号切换、浏览器设备登录、精确本地登出和自定义 `gh.exe` 路径设置。
 
-仓库包含两个桌面实现：
+仓库包含三个桌面实现：
 
-- **Rust / Tauri 2 / React**（主实现）：体积更小，提供便携 EXE、MSI 和 NSIS 安装程序，推荐普通用户使用。
+- **Rust / Tauri 2 / React**（主实现）：提供便携 EXE、MSI 和 NSIS 安装程序，推荐普通用户使用。
+- **Rust / GPUI**：Zed 的 GPU 渲染 UI 框架，单个 EXE 免安装即可运行。账号逻辑与 Tauri 版共用同一个 `ghdeck-core`。
 - **Python / PySide6**：早期实现，提供单文件便携 EXE。它没有下面标注“Rust 版”的功能。
 
 ## 功能
@@ -87,10 +88,14 @@ GithubDeck 不自行管理 GitHub 凭据：
 ## 仓库结构
 
 ```text
-assets/          共享 GD 图标母图
-docs/            设计规范与实施计划
-python-version/  Python 3.13 + PySide6 实现
-rust-version/    Rust + Tauri 2 + React 实现
+assets/                      共享 GD 图标母图
+docs/                        设计规范与实施计划
+python-version/              Python 3.13 + PySide6 实现
+rust-version/
+  ghdeck-core/               共享核心：GitHub CLI 调用、浏览器、账号信息
+  src-tauri/                 Tauri 2 后端（薄壳）
+  src/                       Tauri 版的 React 前端
+  gpui-version/              GPUI 版（薄壳）
 ```
 
 ## Python 版本开发

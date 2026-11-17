@@ -1,0 +1,22 @@
+[package]
+name = "ghdeck-core"
+version = "0.4.0"
+description = "GithubDeck core: GitHub CLI account operations shared by the desktop UIs"
+authors = ["FeiJiZai"]
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+regex = "1"
+dirs = "6"
+thiserror = "2"
+dunce = "1"
+tokio-util = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.55"

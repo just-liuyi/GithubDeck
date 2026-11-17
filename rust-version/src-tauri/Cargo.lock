@@ -1247,18 +1247,27 @@ dependencies = [
 
 [[package]]
 name = "ghdeck"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "dirs",
- "dunce",
- "regex",
+ "ghdeck-core",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
- "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ghdeck-core"
+version = "0.4.0"
+dependencies = [
+ "dirs",
+ "dunce",
+ "regex",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",

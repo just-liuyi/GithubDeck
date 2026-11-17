@@ -1,16 +1,7 @@
-mod account_meta;
-mod auth_parser;
-mod browsers;
-mod controller;
-mod gh_process;
-mod models;
-mod settings;
-
-use account_meta::MetaStore;
-use browsers::BrowserTarget;
-use controller::{AppStateSnapshot, AuthController, BrowserPlatform};
-use gh_process::GhCli;
-use settings::GhExecutableSettings;
+use ghdeck_core::{
+    detect, launch, AppStateSnapshot, AuthController, BrowserPlatform, BrowserTarget, GhCli,
+    GhExecutableSettings, MetaStore,
+};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_dialog::DialogExt;
@@ -24,12 +15,12 @@ struct DesktopPlatform {
 
 impl BrowserPlatform for DesktopPlatform {
     fn detect(&self) -> Vec<BrowserTarget> {
-        browsers::detect()
+        detect()
     }
 
     fn open(&self, target: Option<&BrowserTarget>, url: &str) -> Result<(), String> {
         match target {
-            Some(target) => browsers::launch(target, url),
+            Some(target) => launch(target, url),
             None => self
                 .app
                 .opener()

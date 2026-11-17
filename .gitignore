@@ -10,8 +10,11 @@ python-version/dist/
 **/node_modules/
 rust-version/dist/
 
-# Rust / Tauri
-rust-version/src-tauri/target/
+# Rust build output (Tauri, shared core, GPUI)
+**/target/
+
+# Library crate lockfile: the binaries pin versions in their own lockfiles
+rust-version/ghdeck-core/Cargo.lock
 
 # Release staging and migration backups
 release-staging/

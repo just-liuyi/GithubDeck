@@ -1,0 +1,18 @@
+[package]
+name = "ghdeck-gpui"
+version = "0.4.0"
+description = "GithubDeck — GPUI desktop shell for GitHub CLI account management"
+authors = ["FeiJiZai"]
+edition = "2024"
+
+[[bin]]
+name = "GithubDeck-GPUI"
+path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+ghdeck-core = { path = "../ghdeck-core" }
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "windows-manifest"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

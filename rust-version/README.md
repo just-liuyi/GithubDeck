@@ -1,6 +1,6 @@
 # GithubDeck (Rust + Tauri)
 
-GithubDeck 是一款面向 Windows 的 GitHub CLI 多账号桌面管理器。本目录是项目的主实现（**Rust + Tauri 2 + React**）：读取本机已安装的 GitHub CLI，并以图形界面完成状态刷新、账号切换、网页登录和本地登出，同时展示每个账号的令牌权限、绑定账号所在的浏览器，并识别在 GitHub 上改过名的账号。
+GithubDeck 是一款面向 Windows 的 GitHub CLI 多账号桌面管理器。本目录包含两种 Rust 实现：**Tauri 2 + React**（`src-tauri/` 与 `src/`）和 **GPUI**（`gpui-version/`），两者共用 `ghdeck-core/`。：读取本机已安装的 GitHub CLI，并以图形界面完成状态刷新、账号切换、网页登录和本地登出，同时展示每个账号的令牌权限、绑定账号所在的浏览器，并识别在 GitHub 上改过名的账号。
 
 统一项目说明和 Python/PySide6 实现请参阅仓库根目录的 [`README.md`](../README.md)。
 
@@ -15,9 +15,9 @@ GithubDeck 是一款面向 Windows 的 GitHub CLI 多账号桌面管理器。本
 - 通过系统文件对话框选择并校验自定义 `gh.exe` 路径。
 ## 技术栈
 
-- Rust / Tauri 2 后端
-- React 19 + TypeScript + Vite 前端
-- 通过 `invoke` / 事件与本机 `gh.exe` 协作
+- `ghdeck-core/`：账号操作、浏览器探测、本地状态，被两种 UI 共用
+- `src-tauri/` + `src/`：Rust / Tauri 2 后端与 React 19 + TypeScript + Vite 前端
+- `gpui-version/`：Rust / GPUI 0.2 单可执行文件界面
 
 ## 系统要求
 
@@ -39,12 +39,32 @@ C:\Program Files\GitHub CLI\gh.exe
 cd rust-version
 npm install
 npm run tauri dev
+
+# GPUI 版（无需 Node，直接 cargo run）
+cd gpui-version
+cargo run --release
 ```
 
-生产构建：
+生产构建（Tauri 版）：
 
 ```powershell
 npm run tauri build
+```
+
+GPUI 版构建：
+
+```powershell
+cd gpui-version
+cargo build --release
+```
+
+产物为 `target/release/GithubDeck-GPUI.exe`，单个文件即可运行。
+
+`build.rs` 会通过 `winresource` 把 `assets/githubdeck.ico` 编进 exe：Windows 需要一个 GUI 子系统的程序，否则启动时会附带一个控制台窗口；GPUI 还会按资源 ID 1 从 exe 自身读取窗口图标。`tests/packaging.rs` 会检查构建产物确实是 GUI 子系统并且带有图标资源：
+
+```powershell
+cargo build --release
+cargo test --release --test packaging
 ```
 
 主要构建产物：
@@ -65,9 +85,11 @@ npm run tauri build
 
 ```powershell
 npm test -- --run                                   # 前端
-cargo test --manifest-path src-tauri/Cargo.toml     # 后端（控制器使用模拟的 gh，不改动真实账号）
+cargo test --manifest-path ghdeck-core/Cargo.toml   # 账号逻辑（使用模拟的 gh，不改动真实账号）
+cargo test --manifest-path gpui-version/Cargo.toml  # GPUI 界面逻辑
+cargo test --manifest-path src-tauri/Cargo.toml     # Tauri 配置检查
 # 只读冒烟测试：调用真实 gh 执行 auth status / api user，并扫描浏览器
-cargo test --manifest-path src-tauri/Cargo.toml real_gh_smoke -- --ignored --nocapture
+cargo test --manifest-path ghdeck-core/Cargo.toml real_gh_smoke -- --ignored --nocapture
 ```
 ## 使用方法
 

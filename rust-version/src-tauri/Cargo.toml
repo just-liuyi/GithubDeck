@@ -1,6 +1,6 @@
 [package]
 name = "ghdeck"
-version = "0.3.0"
+version = "0.4.0"
 description = "GithubDeck — Windows GitHub CLI multi-account desktop manager"
 authors = ["FeiJiZai"]
 edition = "2021"
@@ -14,19 +14,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+ghdeck-core = { path = "../ghdeck-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
-regex = "1"
-dirs = "6"
-thiserror = "2"
-dunce = "1"
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-dialog = "2"
-tokio-util = "0.7"
-
-[dev-dependencies]
-tempfile = "3"
-
-[target."cfg(windows)".dependencies]
-winreg = "0.55"
